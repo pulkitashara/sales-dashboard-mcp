@@ -1,0 +1,4 @@
+/sales/.venv
+/sales/__pycache__
+/sales/mcp-env
+/sales/uv.lock
