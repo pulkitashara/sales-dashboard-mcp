@@ -6,4 +6,5 @@ dependencies = [
     "psycopg2-binary",
     "fastapi",
     "beeai-framework>=0.1.4",
+    "google-generativeai",
 ]

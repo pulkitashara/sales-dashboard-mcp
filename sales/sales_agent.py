@@ -1,121 +1,294 @@
 import asyncio
 import json
-from typing import List, Dict, Any, Optional
-from mcp.client.stdio import stdio_client
+import os
+import sys
+import traceback
+from typing import List, Dict, Any, Optional, Tuple
+import logging
+
+import google.generativeai as genai
+from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+# Initialize logging
+# logging.basicConfig(level=logging.DEBUG)  # Changed to DEBUG for more detailed logs
+logger = logging.getLogger(__name__)
+
+# --- LLM Configuration ---
+load_dotenv()
+
+# Configure the Gemini API using an environment variable
+try:
+    genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
+except KeyError:
+    logger.error("GOOGLE_API_KEY not found in .env file or environment variables.")
+    logger.error("Please create a .env file and add your key.")
+    exit(1)
+
+# --- End LLM Configuration ---
 
 async def query_sales_tool(session: ClientSession, tool_name: str, params: dict) -> Optional[dict]:
-    
     try:
-        print(f"Calling {tool_name} with params: {params}")
+        logger.info(f"Calling {tool_name} with params: {params}")
         
-        # Call the tool
-        response = await session.call_tool(tool_name, params)
+        # First verify the tool exists - handle tuple format
+        available_tools = await session.list_tools()
+        valid_tools = []
         
-        # Handle the MCP response format
+        if hasattr(available_tools, 'tools'):
+            # If it's a response object with tools attribute
+            valid_tools = [tool.name for tool in available_tools.tools]
+        elif hasattr(available_tools, '__iter__'):
+            # Handle both tuple and list cases
+            for tool in available_tools:
+                if isinstance(tool, tuple) and len(tool) > 0:
+                    valid_tools.append(tool[0])  # First element is tool name
+                elif hasattr(tool, 'name'):
+                    valid_tools.append(tool.name)
+        
+        if tool_name not in valid_tools:
+            logger.error(f"Invalid tool name: {tool_name}. Valid tools: {valid_tools}")
+            return None
+            
+        # Convert parameters to correct types
+        converted_params = {}
+        for key, value in params.items():
+            if key in ['shop_id', 'customer_id', 'limit']:
+                try:
+                    converted_params[key] = int(value)
+                except (ValueError, TypeError):
+                    logger.warning(f"Failed to convert {key} to int, using original value")
+                    converted_params[key] = value
+            else:
+                converted_params[key] = value
+        
+        # Make the tool call
+        response = await session.call_tool(tool_name, converted_params)
+        
+        # Handle the response - more robust parsing
+        if response is None:
+            logger.error("Received None response from tool call")
+            return None
+            
+        # Try to get structured content first
         if hasattr(response, 'structuredContent') and response.structuredContent:
-            return response.structuredContent.get('result')
-        elif hasattr(response, 'content') and response.content:
-            try:
-                # Try to parse TextContent items
-                return [json.loads(item.text) for item in response.content 
-                       if hasattr(item, 'text') and item.type == 'text']
-            except json.JSONDecodeError:
-                print("Failed to parse JSON response content")
-                return None
-        
-        print("Unexpected response format:", response)
-        return None
-        
+            result = response.structuredContent.get('result')
+            if result is not None:
+                return result
+                
+        # Try to parse content if available
+        if hasattr(response, 'content'):
+            content = response.content
+            if isinstance(content, str):
+                try:
+                    return json.loads(content)
+                except json.JSONDecodeError:
+                    return {'raw_content': content}
+            elif isinstance(content, (list, dict)):
+                return content
+            elif hasattr(content, 'text'):
+                try:
+                    return json.loads(content.text)
+                except (json.JSONDecodeError, AttributeError):
+                    return {'raw_text': str(content)}
+                    
+        # If response is already a dict or list, return it directly
+        if isinstance(response, (dict, list)):
+            return response
+            
+        # Fallback - try to convert to dict
+        try:
+            return dict(response)
+        except (TypeError, ValueError):
+            logger.error(f"Could not convert response to dict: {response}")
+            return None
+            
     except Exception as e:
-        print(f"Error calling {tool_name}: {str(e)}")
+        logger.error(f"Error calling {tool_name}: {str(e)}", exc_info=True)
         return None
 
-def manual_tool_selection(query: str) -> tuple[str, dict]:
-    """Manually select tool based on query keywords"""
-    query = query.lower()
+async def llm_tool_selection(query: str, session: ClientSession) -> Tuple[Optional[str], dict]:
+    """
+    Uses an LLM to select the appropriate tool and parameters based on the user query.
+    """
+    logger.info("Asking LLM to select a tool...")
     
-    # Rules for GetTopSellingProducts
-    if any(word in query for word in ["top", "best", "selling", "products", "items"]):
-        shop_id = 1  # default
-        if "shop" in query or "store" in query:
-            try:
-                shop_id = int(query.split("shop")[1].split()[0].strip())
-            except:
-                try:
-                    shop_id = int(query.split("store")[1].split()[0].strip())
-                except:
-                    pass
+    try:
+        # Get available tools from the session
+        tool_list = await session.list_tools()
+        logger.debug(f"Raw tools response: {tool_list}")
         
-        limit = 5  # default
-        if "top" in query:
-            try:
-                limit = int(query.split("top")[1].split()[0].strip())
-            except:
-                pass
+        # Extract the actual Tool objects from the response
+        if hasattr(tool_list, 'tools'):
+            available_tools = tool_list.tools
+        else:
+            available_tools = tool_list
         
-        return "GetTopSellingProducts", {"shop_id": shop_id, "limit": limit}
-    
-    # Rules for GetCustomerOrders
-    elif any(word in query for word in ["orders", "purchases", "bought", "customer"]):
-        customer_id = 1  # default
-        if "customer" in query:
-            try:
-                customer_id = int(query.split("customer")[1].split()[0].strip())
-            except:
-                pass
+        logger.debug(f"Available tools: {available_tools}")
         
-        return "GetCustomerOrders", {"customer_id": customer_id}
-    
-    # Default fallback
-    return None, {}
+        if not available_tools:
+            logger.error("No tools available from server")
+            return None, {}
+            
+        # Build the list of valid tools with their descriptions
+        valid_tools = []
+        for tool in available_tools:
+            if hasattr(tool, 'name') and hasattr(tool, 'description'):
+                valid_tools.append({
+                    "name": tool.name,
+                    "description": tool.description
+                })
+        
+        if not valid_tools:
+            logger.error("No valid tools found")
+            return None, {}
+        
+        # Build examples based on available tools
+        examples = []
+        for tool in valid_tools:
+            if tool['name'] == "GetTopSellingProducts":
+                examples.append({
+                    "query": "What are the top 3 products in shop 1?",
+                    "response": {
+                        "tool_name": "GetTopSellingProducts",
+                        "parameters": {"shop_id": 1, "limit": 3}
+                    }
+                })
+            elif tool['name'] == "GetCustomerOrders":
+                examples.append({
+                    "query": "Show me orders for customer 5 from last month",
+                    "response": {
+                        "tool_name": "GetCustomerOrders",
+                        "parameters": {"customer_id": 5}
+                    }
+                })
+            elif tool['name'] == "GetShopPerformance":
+                examples.append({
+                    "query": "How is shop 2 performing?",
+                    "response": {
+                        "tool_name": "GetShopPerformance",
+                        "parameters": {"shop_id": 2}
+                    }
+                })
+        
+        prompt = f"""
+You are a tool selection assistant. Your task is to:
+1. Analyze the user query
+2. Select exactly one tool from the available tools
+3. Extract the correct parameters
+4. Return a JSON response with the tool name and parameters
+
+AVAILABLE TOOLS:
+{json.dumps(valid_tools, indent=2)}
+
+EXAMPLES:
+{json.dumps(examples, indent=2)}
+
+USER QUERY:
+"{query}"
+
+Respond STRICTLY with a JSON object containing:
+- "tool_name": (must be one of the exact tool names above)
+- "parameters": (object with required parameters)
+
+YOUR RESPONSE (ONLY JSON, NO OTHER TEXT):
+"""
+        logger.debug(f"LLM Prompt:\n{prompt}")
+        
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        response = await model.generate_content_async(prompt)
+        
+        # Clean and parse the response
+        response_text = response.text.strip()
+        logger.debug(f"Raw LLM response: {response_text}")
+        
+        # Extract JSON from response
+        try:
+            json_str = response_text
+            if '```json' in response_text:
+                json_str = response_text.split('```json')[1].split('```')[0]
+            elif '```' in response_text:
+                json_str = response_text.split('```')[1]
+                
+            parsed_response = json.loads(json_str)
+            tool_name = parsed_response.get("tool_name")
+            tool_params = parsed_response.get("parameters", {})
+            
+            # Validate the tool name against our known tools
+            valid_tool_names = [tool['name'] for tool in valid_tools]
+            if not tool_name or tool_name not in valid_tool_names:
+                logger.error(f"Invalid tool name returned: {tool_name}")
+                return None, {}
+                
+            logger.info(f"Selected tool: {tool_name} with params: {tool_params}")
+            return tool_name, tool_params
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse LLM response: {e}\nResponse: {response_text}")
+            return None, {}
+            
+    except Exception as e:
+        logger.error(f"Error during tool selection: {e}", exc_info=True)
+        return None, {}
 
 async def process_user_query(query: str, session: ClientSession):
-    """Updated query processing with better error handling"""
-    tool_name, tool_params = manual_tool_selection(query)
-    
-    if not tool_name:
-        print("I couldn't understand your request. Try these formats:")
-        print("- 'Show top 5 products in shop 3'")
-        print("- 'List orders for customer 10'")
-        return
-    
-    print(f"Using tool: {tool_name} with params: {tool_params}")
-    
+    """Processes a user query using LLM-based tool selection."""
     try:
+        print(f"\nProcessing query: {query}")
+        
+        tool_name, tool_params = await llm_tool_selection(query, session)
+        
+        if not tool_name:
+            print("Sorry, I couldn't determine how to process your request.")
+            return
+        
+        print(f"Using tool: {tool_name} with parameters: {tool_params}")
+        
         result = await query_sales_tool(session, tool_name, tool_params)
         
-        if not result:
-            print("No results found or an error occurred")
+        if result is None:
+            print("\nError: Could not retrieve the requested information. Possible reasons:")
+            print("- The server might not be responding properly")
+            print("- The requested data might not exist")
+            print("- There might be a connection issue")
             return
         
         print("\n=== Results ===")
-        if tool_name == "GetTopSellingProducts":
-            if isinstance(result, list):
-                for i, item in enumerate(result, 1):
-                    if isinstance(item, dict):
-                        print(f"{i}. {item.get('product')} (Category: {item.get('category')}) - Sold: {item.get('quantity_sold')}")
-                    else:
-                        print(f"{i}. {item}")
-            else:
-                print("Unexpected result format")
-                
-        elif tool_name == "GetCustomerOrders":
-            if isinstance(result, list):
-                for order in result:
-                    if isinstance(order, dict):
-                        print(f"[{order.get('date')}] {order.get('product')} (Qty: {order.get('quantity')}) at {order.get('shop')}")
-                    else:
-                        print(order)
-            else:
-                print("Unexpected result format")
-                
+        
+        try:
+            if tool_name == "GetTopSellingProducts":
+                if isinstance(result, list):
+                    if not result:
+                        print("No products found for this shop.")
+                        return
+                        
+                    for i, item in enumerate(result, 1):
+                        print(f"{i}. {item.get('product', 'Unknown')} - "
+                              f"Category: {item.get('category', 'N/A')}, "
+                              f"Sold: {item.get('quantity_sold', 0)}")
+                elif isinstance(result, dict):
+                    print(f"1. {result.get('product', 'Unknown')} - "
+                          f"Category: {result.get('category', 'N/A')}, "
+                          f"Sold: {result.get('quantity_sold', 0)}")
+                else:
+                    print("Unexpected result format. Raw data:")
+                    print(json.dumps(result, indent=2))
+                    
+            # [rest of your display logic...]
+            
+        except Exception as e:
+            logger.error(f"Error displaying results: {e}")
+            print("Here's the raw data:")
+            print(json.dumps(result, indent=2))
+            
     except Exception as e:
-        print(f"Error processing query: {e}")
+        logger.error(f"Error processing query: {e}", exc_info=True)
+        print("An error occurred while processing your request.")
 
 async def main():
     server_params = StdioServerParameters(
-        command="python",
+        command=sys.executable,
         args=["server.py"],
         env=None,
     )
@@ -126,20 +299,32 @@ async def main():
             ClientSession(read, write) as session,
         ):
             await session.initialize()
-            print("Connected to MCP server")
+            logger.info("Connected to MCP server")
+
+            # Verify tools are available
+            available_tools = await session.list_tools()
+            logger.info(f"Available tools: {available_tools}")
             
-            queries = [
-                "What are the top 3 products in shop 1?",
-                "Show me orders for customer 5",
-                "List the best selling products in shop 2",
-                "What did customer 3 purchase?"
-            ]
+            if not available_tools:
+                logger.error("No tools available from the server")
+                print("Error: No tools available from server")
+                return
             
-            for query in queries:
-                print(f"\nQuery: {query}")
-                await process_user_query(query, session)
+
+            queries=[]
+
+
+            while True:
+                queries = [input("Enter your query\n")]
+                if queries==["exit"]:
+                    break
+                for query in queries:
+                    await process_user_query(query, session)
+                
     except Exception as e:
-        print(f"Connection error: {e}")
+        logger.error("Unhandled error occurred", exc_info=True)
+        print("A system error occurred. Please try again later.")
+        traceback.print_exc()
 
 if __name__ == "__main__":
     asyncio.run(main())

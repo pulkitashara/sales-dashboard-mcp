@@ -12,8 +12,6 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("sales-assistant")
 
 class DatabaseManager:
-   
-    
     def __init__(self):
         self.conn_params = {
             "dbname": "sales_dashboard",
@@ -84,14 +82,16 @@ def GetCustomerOrders(
     start_date: Optional[str] = None, 
     end_date: Optional[str] = None
 ) -> List[Dict]:
-    """Returns order history for a specific customer.
+    # --- START OF THE FIX ---
+    """Returns order history for a specific customer, with an optional date range.
     Args:
-        customer_id: ID of the customer
-        start_date: Optional start date (YYYY-MM-DD)
-        end_date: Optional end date (YYYY-MM-DD)
+        customer_id: ID of the customer whose orders to retrieve.
+        start_date: Optional start date to filter orders (YYYY-MM-DD).
+        end_date: Optional end date to filter orders (YYYY-MM-DD).
     Returns:
-        List of orders with product details
+        A list of dictionaries, each representing an order.
     """
+    # --- END OF THE FIX ---
     try:
         conn = db_manager.get_connection()
         cur = conn.cursor()
